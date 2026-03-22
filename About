@@ -1,0 +1,219 @@
+# DPI Engine 🔍
+
+![C++](https://img.shields.io/badge/Language-C++17-blue)
+![Networking](https://img.shields.io/badge/Domain-Networking-orange)
+![Status](https://img.shields.io/badge/Status-Complete-success)
+
+**DPI Engine** is a **Deep Packet Inspection system** written in C++. It reads network traffic from a file, looks inside each packet to identify which app it belongs to (YouTube, Facebook, etc.), and blocks or forwards traffic based on rules you define.
+
+---
+
+## 🤔 What is Deep Packet Inspection?
+
+When you visit a website, your data travels as small chunks called **packets**. A normal firewall only checks *where* a packet is going. DPI goes deeper — it looks *inside* the packet to see *what app* is sending it.
+
+Think of it like this:
+- Normal firewall = checking the address on an envelope
+- DPI = opening the envelope and reading what's inside
+
+---
+
+## 💡 The Core Idea — How We Identify Apps
+
+Even though HTTPS traffic is encrypted, there is **one thing that is always visible** — the domain name.
+
+When your browser connects to `https://www.youtube.com`, it sends a message called a **TLS Client Hello**. This message contains the domain name in plain text — this is called the **SNI (Server Name Indication)**.
+
+```
+Your Browser → sends TLS Client Hello → contains "www.youtube.com" ← we read THIS
+               (everything after this is encrypted)
+```
+
+So even though we cannot read what you are watching on YouTube, we can see that you are connecting to YouTube. That is enough to block it.
+
+---
+
+## 🔄 How a Packet Flows Through the System
+
+Every packet goes through these steps:
+
+**1. Read** — Load the packet from a `.pcap` file (network capture file saved by tools like Wireshark)
+
+**2. Parse** — Unpack the packet layer by layer:
+- Ethernet layer → gives us MAC addresses
+- IP layer → gives us source and destination IP addresses
+- TCP/UDP layer → gives us port numbers
+
+**3. Identify the connection** — Every connection is identified by 5 values called a **Five-Tuple**:
+```
+Source IP + Destination IP + Source Port + Destination Port + Protocol
+```
+All packets with the same five values belong to the same connection.
+
+**4. Inspect** — Look inside the packet payload:
+- If port is 443 (HTTPS) → extract the SNI to get the domain name
+- If port is 80 (HTTP) → extract the Host header to get the domain name
+- Map the domain to an app: `youtube.com` → YouTube, `facebook.com` → Facebook
+
+**5. Check rules** — Should this packet be blocked?
+- Is the source IP in the blocked list?
+- Is the app (YouTube, TikTok) in the blocked list?
+- Does the domain name match a blocked keyword?
+
+**6. Forward or Drop** — If blocked, the packet is thrown away. If not, it is written to the output file.
+
+---
+
+## 🏗 Two Versions
+
+### Simple Version (`main_working.cpp`)
+- Processes one packet at a time
+- Easy to understand
+- Good for small captures
+
+### Multi-threaded Version (`dpi_mt.cpp`)
+- Processes many packets at the same time using multiple threads
+- Much faster for large captures
+- Uses this pipeline:
+
+```
+Reader → Load Balancers → Fast Path Workers → Output Writer
+```
+
+The key rule in multi-threading: **all packets from the same connection always go to the same worker thread**. This is done using consistent hashing on the five-tuple. This means one thread always has the full picture of a connection and never misses the SNI.
+
+---
+
+## 📁 Project Structure
+
+```
+packet_analyzer/
+├── include/               ← Header files (what each component does)
+│   ├── pcap_reader.h      ← Reads .pcap files
+│   ├── packet_parser.h    ← Parses Ethernet, IP, TCP headers
+│   ├── sni_extractor.h    ← Extracts domain name from TLS/HTTP
+│   ├── types.h            ← Data structures (FiveTuple, AppType)
+│   └── ...
+│
+├── src/                   ← Implementation files (how it's done)
+│   ├── main_working.cpp   ← Simple single-threaded version
+│   ├── dpi_mt.cpp         ← Multi-threaded version
+│   └── ...
+│
+└── generate_test_pcap.py  ← Creates sample traffic for testing
+```
+
+---
+
+## ⚙️ Installation
+
+**Requirements:** macOS or Linux, C++17 compiler (g++ or clang++)
+
+### Build Simple Version
+```bash
+g++ -std=c++17 -O2 -I include -o dpi_simple \
+    src/main_working.cpp \
+    src/pcap_reader.cpp \
+    src/packet_parser.cpp \
+    src/sni_extractor.cpp \
+    src/types.cpp
+```
+
+### Build Multi-threaded Version
+```bash
+g++ -std=c++17 -pthread -O2 -I include -o dpi_engine \
+    src/dpi_mt.cpp \
+    src/pcap_reader.cpp \
+    src/packet_parser.cpp \
+    src/sni_extractor.cpp \
+    src/types.cpp
+```
+
+---
+
+## 🚀 Running
+
+### Basic — just analyze traffic
+```bash
+./dpi_engine input.pcap output.pcap
+```
+
+### With blocking rules
+```bash
+./dpi_engine input.pcap output.pcap \
+    --block-app YouTube \
+    --block-app TikTok \
+    --block-ip 192.168.1.50 \
+    --block-domain facebook
+```
+
+### Control number of threads
+```bash
+./dpi_engine input.pcap output.pcap --lbs 4 --fps 4
+```
+
+### Generate test traffic
+```bash
+python3 generate_test_pcap.py
+```
+
+---
+
+## 📊 Sample Output
+
+```
+Total Packets:      77
+Forwarded:          69
+Dropped:             8
+
+APPLICATION BREAKDOWN
+HTTPS         39   50.6%
+YouTube        4    5.2%  ← BLOCKED
+Facebook       3    3.9%
+DNS            4    5.2%
+
+DETECTED DOMAINS
+  www.youtube.com  → YouTube  (BLOCKED)
+  www.facebook.com → Facebook
+  www.google.com   → Google
+```
+
+---
+
+## 🔒 Blocking Rules Explained
+
+There are 3 ways to block traffic:
+
+| Rule | Example | What gets blocked |
+|------|---------|-------------------|
+| Block by IP | `192.168.1.50` | All traffic from that device |
+| Block by App | `YouTube` | All YouTube connections |
+| Block by Domain | `tiktok` | Any domain containing "tiktok" |
+
+**Important:** Blocking works at the connection level. The first few packets of a connection are always forwarded because we haven't seen the domain name yet. Once we see the SNI in the Client Hello packet, we mark the entire connection as blocked and drop all packets from that connection from that point on.
+
+---
+
+## ❓ Common Questions
+
+**Q: Why can we see the domain name even in HTTPS?**
+The domain name is sent before encryption starts. It is in the TLS Client Hello message in plain text. After that first message, everything is encrypted and we cannot read it.
+
+**Q: Why does the same connection always go to the same thread?**
+Because we need to track the state of a connection. If packets went to different threads, one thread might see the SNI and another might not, and blocking would break. Consistent hashing on the five-tuple solves this.
+
+**Q: What is a .pcap file?**
+It is a file that stores recorded network traffic. Tools like Wireshark can create them. Our engine reads these files instead of live network traffic.
+
+**Q: What if a packet has no SNI?**
+It gets classified as UNKNOWN or HTTPS (if on port 443) and is forwarded unless the IP itself is blocked.
+
+---
+
+## 🚀 Future Improvements
+
+- Support for QUIC / HTTP3 traffic
+- Live traffic capture instead of only reading from files
+- Real-time statistics dashboard
+- Bandwidth throttling instead of just blocking
+- Save and load rules from a file
